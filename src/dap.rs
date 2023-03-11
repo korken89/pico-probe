@@ -1,12 +1,13 @@
 use crate::systick_delay::Delay;
-use dap_rs::{swj::Swj, *};
-use defmt::*;
+use dap_rs::{*, swj::Dependencies};
+use defmt::trace;
 use embedded_hal::{
     blocking::delay::DelayUs,
     digital::v2::{InputPin, OutputPin, PinState},
 };
 use rp_pico::hal::gpio::DynPin;
 
+// I'm not sure about the naming, both of implementing structs but also of the trait
 pub struct Context {
     max_frequency: u32,
     cpu_frequency: u32,
@@ -43,14 +44,6 @@ impl core::fmt::Debug for Context {
     }
 }
 
-impl dap::DapContext for Context {
-    fn high_impedance_mode(&mut self) {
-        self.swdio.into_floating_disabled();
-        self.swclk.into_floating_disabled();
-        self.nreset.into_floating_disabled();
-    }
-}
-
 impl Context {
     fn from_pins(
         swdio: DynPin,
@@ -74,8 +67,8 @@ impl Context {
     }
 }
 
-impl swj::Swj for Context {
-    fn pins(&mut self, output: swj::Pins, mask: swj::Pins, wait_us: u32) -> swj::Pins {
+impl swj::Dependencies<Swd, Jtag> for Context {
+    fn process_swj_pins(&mut self, output: swj::Pins, mask: swj::Pins, wait_us: u32) -> swj::Pins {
         trace!("Running SWJ_pins");
         if mask.contains(swj::Pins::SWCLK) {
             self.swclk.into_push_pull_output();
@@ -102,7 +95,8 @@ impl swj::Swj for Context {
         if mask.contains(swj::Pins::NRESET) {
             if output.contains(swj::Pins::NRESET) {
                 // "open drain"
-                self.nreset.into_floating_disabled();
+                // TODO: What is really "output open drain"?
+                self.nreset.into_pull_up_input();
             } else {
                 self.nreset.into_push_pull_output();
                 self.nreset.set_low().ok();
@@ -110,10 +104,6 @@ impl swj::Swj for Context {
         }
 
         self.delay.delay_ticks(self.cycles_per_us * wait_us);
-
-        self.swclk.into_floating_input();
-        self.swdio.into_floating_input();
-        self.nreset.into_floating_input();
 
         let mut ret = swj::Pins::empty();
         ret.set(swj::Pins::SWCLK, matches!(self.swclk.is_high(), Ok(true)));
@@ -123,7 +113,7 @@ impl swj::Swj for Context {
         ret
     }
 
-    fn sequence(&mut self, data: &[u8], mut bits: usize) {
+    fn process_swj_sequence(&mut self, data: &[u8], mut bits: usize) {
         trace!("Running SWJ sequence");
         self.swdio.into_push_pull_output();
         self.swclk.into_push_pull_output();
@@ -150,12 +140,9 @@ impl swj::Swj for Context {
             }
             bits -= frame_bits;
         }
-
-        self.swclk.into_floating_input();
-        self.swdio.into_floating_input();
     }
 
-    fn set_clock(&mut self, max_frequency: u32) -> bool {
+    fn process_swj_clock(&mut self, max_frequency: u32) -> bool {
         trace!("Running SWJ clock");
         if max_frequency < self.cpu_frequency {
             self.max_frequency = max_frequency;
@@ -166,6 +153,12 @@ impl swj::Swj for Context {
         } else {
             false
         }
+    }
+
+    fn high_impedance_mode(&mut self) {
+        self.swdio.into_floating_disabled();
+        self.swclk.into_floating_disabled();
+        self.nreset.into_floating_disabled();
     }
 }
 
@@ -180,52 +173,51 @@ impl dap::DapLeds for Leds {
 
 pub struct Jtag(Context);
 
+impl From<Jtag> for Context {
+    fn from(value: Jtag) -> Self {
+        value.0
+    }
+}
+
+impl From<Context> for Jtag {
+    fn from(value: Context) -> Self {
+        Self(value)
+    }
+}
+
 impl jtag::Jtag<Context> for Jtag {
     const AVAILABLE: bool = false;
-
-    fn new(context: Context) -> Self {
-        Jtag(context)
-    }
-
-    fn release(self) -> Context {
-        self.0
-    }
 
     fn sequences(&mut self, _data: &[u8], _rxbuf: &mut [u8]) -> u32 {
         0
     }
 
     fn set_clock(&mut self, max_frequency: u32) -> bool {
-        self.0.set_clock(max_frequency)
+        self.0.process_swj_clock(max_frequency)
     }
 }
 
 #[derive(Debug, defmt::Format)]
 pub struct Swd(Context);
 
+impl From<Swd> for Context {
+    fn from(value: Swd) -> Self {
+        value.0
+    }
+}
+
+impl From<Context> for Swd {
+    fn from(mut value: Context) -> Self {
+        // Maybe this should go to some `Swd::new`
+        value.swdio.into_push_pull_output();
+        value.swclk.into_push_pull_output();
+        value.nreset.into_floating_disabled();
+        Self(value)
+    }
+}
+
 impl swd::Swd<Context> for Swd {
     const AVAILABLE: bool = true;
-
-    fn new(mut context: Context) -> Self {
-        trace!("Creating SWD");
-        context.swdio.into_push_pull_output();
-        context.swclk.into_push_pull_output();
-
-        Self(context)
-    }
-
-    fn release(mut self) -> Context {
-        trace!("Releasing SWD");
-        self.0.swclk.into_floating_input();
-        self.0.swdio.into_floating_input();
-
-        self.0
-    }
-
-    fn configure(&mut self, period: swd::TurnaroundPeriod, data_phase: swd::DataPhase) -> bool {
-        trace!("SWD configure");
-        period == swd::TurnaroundPeriod::Cycles1 && data_phase == swd::DataPhase::NoDataPhase
-    }
 
     fn read_inner(&mut self, apndp: swd::APnDP, a: swd::DPRegister) -> swd::Result<u32> {
         trace!("SWD read, apndp: {}, addr: {}", apndp, a,);
@@ -302,7 +294,7 @@ impl swd::Swd<Context> for Swd {
 
     fn set_clock(&mut self, max_frequency: u32) -> bool {
         trace!("SWD set clock: freq = {}", max_frequency);
-        self.0.set_clock(max_frequency)
+        self.0.process_swj_clock(max_frequency)
     }
 }
 
@@ -477,7 +469,7 @@ pub fn create_dap(
     nreset: DynPin,
     cpu_frequency: u32,
     delay: &'static Delay,
-) -> dap::Dap<'static, Context, Leds, Wait, Jtag, Swd, Swo> {
+) -> crate::setup::DapHandler {
     let context = Context::from_pins(swdio, swclk, nreset, cpu_frequency, delay);
     let leds = Leds {};
     let wait = Wait::new(delay);
@@ -485,5 +477,5 @@ pub fn create_dap(
 
     defmt::info!("Making dap interface with context: {}", context);
 
-    dap::Dap::from_parts(context, leds, wait, swo, version_string)
+    dap::Dap::new(context, leds, wait, swo, version_string)
 }
